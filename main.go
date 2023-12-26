@@ -2,19 +2,84 @@ package main
 
 import (
 	"bufio"
-	"fmt"
-	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 )
 
 type ImportPackage struct {
-	name             string
-	shortName        string
-	packagePath      string
-	isFunctionImport bool
-	functions        []string
+	name             string   // the real name of the package
+	shortName        string   // the imported name into the relevant module
+	packagePath      string   // the path to the file that holds the package
+	isFunctionImport bool     // is it imported as from module import function or not
+	functions        []string // holds the name of the functions that is used from the package
+	lines            []int    // holds the position of the lines that the import package appears in to facilitate easier search when copying later
+}
+
+func (p *ImportPackage) importDependencies(toFile string) error {
+	file, err := os.Open(p.packagePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	outFile, err := os.OpenFile(toFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0660)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	scanner := bufio.NewScanner(file)
+	writer := bufio.NewWriter(outFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) > 2 && line[:3] == "def" {
+			function_name := parseFunctionName(line[4:])
+			for _, v := range p.functions {
+				if v == function_name {
+					def := parseFunctionDefinition(v, scanner, line)
+					writeFunctionDefinition(def, writer)
+					break
+				}
+			}
+		}
+	}
+	err = writer.Flush()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func importAllDependencies(packages []*ImportPackage, writePath string) {
+	for i := range packages {
+		packages[i].importDependencies(writePath)
+	}
+}
+
+func parseFunctionDefinition(name string, scanner *bufio.Scanner, defLine string) []string {
+	out := make([]string, 1)
+	out[0] = defLine
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || !unicode.IsSpace(rune(line[0])) {
+			break
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func writeFunctionDefinition(def []string, writer *bufio.Writer) {
+	for _, v := range def {
+		_, err := writer.WriteString(v + "\n")
+		if err != nil {
+			panic(err)
+		}
+	}
+	_, err := writer.WriteString("\n")
+	if err != nil {
+		panic(err)
+	}
 }
 
 func parseWord(s string) string {
@@ -43,7 +108,7 @@ func differenceListSet(l1 []string, l2 []string) []string {
 	return out
 }
 
-func parseFunction(s string) string {
+func parseFunctionName(s string) string {
 	// Parses from the first character in string to the next starting paranthesis
 	a := make([]byte, 0)
 	for i := range s {
@@ -82,7 +147,7 @@ func isInList(s string, l []string) bool {
 	return false
 }
 
-func parsePackagesFunctions(s string, packages []*ImportPackage) {
+func parsePackagesFunctions(s string, packages []*ImportPackage, lineNumber int) {
 	for p := range packages {
 		i := 0
 		for i < len(packages[p].shortName) {
@@ -90,10 +155,11 @@ func parsePackagesFunctions(s string, packages []*ImportPackage) {
 			if i == -1 {
 				break
 			}
-			next_function := parseFunction(s[i+len(packages[p].shortName)+1:])
+			next_function := parseFunctionName(s[i+len(packages[p].shortName)+1:])
 			if !isInList(next_function, packages[p].functions) {
 				packages[p].functions = append(packages[p].functions, next_function)
 			}
+			packages[p].lines = append(packages[p].lines, lineNumber)
 			i += len(packages[p].shortName)
 		}
 	}
@@ -108,7 +174,7 @@ func isAlreadyPackage(shortName string, packages []*ImportPackage) (bool, *Impor
 	return false, nil
 }
 
-func addImportPackage(s string, packages *[]*ImportPackage) {
+func addImportPackage(s string, packages *[]*ImportPackage, parentPath string) {
 	isFunctionImport := false
 	var functions []string
 	var shortName, name string
@@ -135,7 +201,8 @@ func addImportPackage(s string, packages *[]*ImportPackage) {
 		ptr.functions = append(ptr.functions, functions...)
 	} else {
 		this_package := ImportPackage{name: name, shortName: shortName,
-			packagePath: "Test", isFunctionImport: isFunctionImport, functions: functions}
+			packagePath:      filepath.Join(filepath.Dir(parentPath), name+".py"),
+			isFunctionImport: isFunctionImport, functions: functions}
 		*packages = append(*packages, &this_package)
 	}
 }
@@ -150,23 +217,94 @@ func findAllImports(path string) ([]*ImportPackage, error) {
 	var importPackages []*ImportPackage
 	var line string
 	scanner := bufio.NewScanner(file)
+	counter := 0
 	for scanner.Scan() {
 		line = scanner.Text()
 		if strings.Contains(line, "import") {
-			addImportPackage(line, &importPackages)
+			addImportPackage(line, &importPackages, path)
 		} else {
-			parsePackagesFunctions(line, importPackages)
+			parsePackagesFunctions(line, importPackages, counter)
 		}
+		counter++
 	}
 	return importPackages, scanner.Err()
+}
+
+func createOutFile(writePath string) {
+	dest, err := os.Create(writePath)
+	if err != nil {
+		panic(err)
+	}
+	defer dest.Close()
+}
+
+func (p *ImportPackage) isLineInLines(lineNumber int) bool {
+	for i := range p.lines {
+		if lineNumber == p.lines[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func replacePackageNames(lineNumber int, s string, packages []*ImportPackage) string {
+	for p := range packages {
+		if packages[p].isLineInLines(lineNumber) {
+			s = strings.ReplaceAll(s, packages[p].shortName+".", "")
+		}
+	}
+	return s
+}
+
+func copyOriginalFile(path string, outPath string, packages []*ImportPackage) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	outFile, err := os.OpenFile(outPath, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0660)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	scanner := bufio.NewScanner(file)
+	writer := bufio.NewWriter(outFile)
+	counter := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.Contains(line, "import") {
+			line := replacePackageNames(counter, line, packages)
+			_, err := writer.WriteString(line + "\n")
+			if err != nil {
+				return err
+			}
+		}
+		counter++
+	}
+	err = writer.Flush()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func main() {
 	args := os.Args
 	path := args[1]
-	arr, err := findAllImports(path)
+	writePath := "C:\\Users\\thomast\\PycharmProjects\\ScriptAlone\\out.py"
+	packages, err := findAllImports(path)
 	if err != nil {
-		log.Fatal("Something went wrong")
+		panic("Something went wrong")
 	}
-	fmt.Println(arr)
+	createOutFile(writePath)
+	// Need to be able to flag the dependiencies that should not be overwritten in the future
+	// right now it will just overwrite and look for all dependiencies that exist
+	// I think we could just flag the dependencies to not overwrite at the start
+	// and then import those in a function here before the necessary dependency functions are imported
+	// and then file just import all the code from the passed in file after those other functions have been imported
+	importAllDependencies(packages, writePath)
+	err = copyOriginalFile(path, writePath, packages)
+	if err != nil {
+		panic("Something went wrong")
+	}
 }
