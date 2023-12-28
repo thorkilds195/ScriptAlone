@@ -9,15 +9,21 @@ import (
 )
 
 type ImportPackage struct {
-	name             string   // the real name of the package
-	shortName        string   // the imported name into the relevant module
-	packagePath      string   // the path to the file that holds the package
-	isFunctionImport bool     // is it imported as from module import function or not
-	functions        []string // holds the name of the functions that is used from the package
-	lines            []int    // holds the position of the lines that the import package appears in to facilitate easier search when copying later
+	name             string           // the real name of the package
+	shortName        string           // the imported name into the relevant module
+	packagePath      string           // the path to the file that holds the package
+	isFunctionImport bool             // is it imported as from module import function or not
+	functions        []string         // holds the name of the functions that is used from the package
+	lines            []int            // holds the position of the lines that the import package appears in to facilitate easier search when copying later
+	childImports     []*ImportPackage // a pointer to the next import packages in case of cascading imports
+	parent           *ImportPackage   // FATHER
 }
 
-func (p *ImportPackage) importDependencies(toFile string) error {
+func (p *ImportPackage) importDependencies(toFile string, writtenDependencies *[]string) error {
+	// For now, written dependencies holds an overview all previously written dpoendecies
+	// This is to make sure we dont write the function definition for the same dependecy twice
+	// This is defined as the same function name, but ideally should be defined as the same function name from the same package
+	// In those cases were we have the same function name from the same package we might want to add some unique function identifier to the front of the package
 	file, err := os.Open(p.packagePath)
 	if err != nil {
 		return err
@@ -35,9 +41,10 @@ func (p *ImportPackage) importDependencies(toFile string) error {
 		if len(line) > 2 && line[:3] == "def" {
 			function_name := parseFunctionName(line[4:])
 			for _, v := range p.functions {
-				if v == function_name {
+				if v == function_name && !hasFunctionBeenWrittenBefore(function_name, writtenDependencies) {
+					*writtenDependencies = append(*writtenDependencies, function_name)
 					def := parseFunctionDefinition(v, scanner, line)
-					writeFunctionDefinition(def, writer)
+					writeFunctionDefinition(def, writer, p)
 					break
 				}
 			}
@@ -47,13 +54,21 @@ func (p *ImportPackage) importDependencies(toFile string) error {
 	if err != nil {
 		return err
 	}
+	for i := range p.childImports {
+		p.childImports[i].importDependencies(toFile, writtenDependencies)
+	}
 	return nil
 }
 
 func importAllDependencies(packages []*ImportPackage, writePath string) {
+	writtenDependencies := make([]string, 0)
 	for i := range packages {
-		packages[i].importDependencies(writePath)
+		packages[i].importDependencies(writePath, &writtenDependencies)
 	}
+}
+
+func hasFunctionBeenWrittenBefore(function_name string, previous_functions *[]string) bool {
+	return isInList(function_name, *previous_functions)
 }
 
 func parseFunctionDefinition(name string, scanner *bufio.Scanner, defLine string) []string {
@@ -69,9 +84,10 @@ func parseFunctionDefinition(name string, scanner *bufio.Scanner, defLine string
 	return out
 }
 
-func writeFunctionDefinition(def []string, writer *bufio.Writer) {
+func writeFunctionDefinition(def []string, writer *bufio.Writer, p *ImportPackage) {
 	for _, v := range def {
-		_, err := writer.WriteString(v + "\n")
+		s := replacePackageNames(-1, v, p.childImports)
+		_, err := writer.WriteString(s + "\n")
 		if err != nil {
 			panic(err)
 		}
@@ -147,9 +163,15 @@ func isInList(s string, l []string) bool {
 	return false
 }
 
-func parsePackagesFunctions(s string, packages []*ImportPackage, lineNumber int) {
+func parsePackagesFunctions(s string, packages []*ImportPackage, lineNumber int, calling_function *string) {
 	for p := range packages {
 		i := 0
+		if len(s) > 2 && s[:3] == "def" {
+			*calling_function = parseFunctionName(s[4:])
+			// TODO: This calling function thing needs to be done better
+			// The idea is that we need to know which function the inner function definition is called from to understand whether we should include the function in case of cascading imports from functions
+			// For example it would be no point in importing a function from a package which is not used in the main script we are interested in
+		}
 		for i < len(packages[p].shortName) {
 			i = strings.Index(s[i:], packages[p].shortName)
 			if i == -1 {
@@ -157,7 +179,9 @@ func parsePackagesFunctions(s string, packages []*ImportPackage, lineNumber int)
 			}
 			next_function := parseFunctionName(s[i+len(packages[p].shortName)+1:])
 			if !isInList(next_function, packages[p].functions) {
-				packages[p].functions = append(packages[p].functions, next_function)
+				if packages[p].parent == nil || isInList(*calling_function, packages[p].parent.functions) {
+					packages[p].functions = append(packages[p].functions, next_function)
+				}
 			}
 			packages[p].lines = append(packages[p].lines, lineNumber)
 			i += len(packages[p].shortName)
@@ -174,7 +198,7 @@ func isAlreadyPackage(shortName string, packages []*ImportPackage) (bool, *Impor
 	return false, nil
 }
 
-func addImportPackage(s string, packages *[]*ImportPackage, parentPath string) {
+func addImportPackage(s string, packages *[]*ImportPackage, parentPath string, parent *ImportPackage) {
 	isFunctionImport := false
 	var functions []string
 	var shortName, name string
@@ -202,12 +226,12 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string) {
 	} else {
 		this_package := ImportPackage{name: name, shortName: shortName,
 			packagePath:      filepath.Join(filepath.Dir(parentPath), name+".py"),
-			isFunctionImport: isFunctionImport, functions: functions}
+			isFunctionImport: isFunctionImport, functions: functions, parent: parent}
 		*packages = append(*packages, &this_package)
 	}
 }
 
-func findAllImports(path string) ([]*ImportPackage, error) {
+func findFileImports(path string, parent *ImportPackage) ([]*ImportPackage, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -215,19 +239,51 @@ func findAllImports(path string) ([]*ImportPackage, error) {
 	defer file.Close()
 
 	var importPackages []*ImportPackage
-	var line string
+	var line, calling_function string
 	scanner := bufio.NewScanner(file)
 	counter := 0
 	for scanner.Scan() {
 		line = scanner.Text()
 		if strings.Contains(line, "import") {
-			addImportPackage(line, &importPackages, path)
+			addImportPackage(line, &importPackages, path, parent)
 		} else {
-			parsePackagesFunctions(line, importPackages, counter)
+			parsePackagesFunctions(line, importPackages, counter, &calling_function)
 		}
 		counter++
 	}
 	return importPackages, scanner.Err()
+}
+
+func (p *ImportPackage) findChildImports() error {
+	// Call this recursively until we have exhausted the amount of imports
+	packages, err := findFileImports(p.packagePath, p)
+	if len(packages) == 0 {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// Adds the parent and child relations for these packages here right now
+	// Need to refactor this later so it is in the same package creation step
+	p.childImports = packages
+	for i := range packages {
+		packages[i].findChildImports()
+	}
+	return nil
+}
+
+func findAllImports(path string) ([]*ImportPackage, error) {
+	// Starts by finding the main file's file imports
+	packages, err := findFileImports(path, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Then find any subsequent imports that is necessary for the main file
+	// This alters the original packages returned from the above function
+	for i := range packages {
+		packages[i].findChildImports()
+	}
+	return packages, nil
 }
 
 func createOutFile(writePath string) {
@@ -249,7 +305,7 @@ func (p *ImportPackage) isLineInLines(lineNumber int) bool {
 
 func replacePackageNames(lineNumber int, s string, packages []*ImportPackage) string {
 	for p := range packages {
-		if packages[p].isLineInLines(lineNumber) {
+		if lineNumber == -1 || packages[p].isLineInLines(lineNumber) {
 			s = strings.ReplaceAll(s, packages[p].shortName+".", "")
 		}
 	}
