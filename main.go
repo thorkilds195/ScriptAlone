@@ -2,11 +2,18 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
 )
+
+type Settings struct {
+	IgnorablePackages    []string
+	InstallationPackages map[string]string
+}
 
 type ImportPackage struct {
 	name             string           // the real name of the package
@@ -20,7 +27,7 @@ type ImportPackage struct {
 }
 
 func (p *ImportPackage) importDependencies(toFile string, writtenDependencies *[]string) error {
-	// For now, written dependencies holds an overview all previously written dpoendecies
+	// For now, written dependencies holds an overview all previously written dependecies
 	// This is to make sure we dont write the function definition for the same dependecy twice
 	// This is defined as the same function name, but ideally should be defined as the same function name from the same package
 	// In those cases were we have the same function name from the same package we might want to add some unique function identifier to the front of the package
@@ -198,7 +205,17 @@ func isAlreadyPackage(shortName string, packages []*ImportPackage) (bool, *Impor
 	return false, nil
 }
 
-func addImportPackage(s string, packages *[]*ImportPackage, parentPath string, parent *ImportPackage) {
+func doesPackageNameExist(name string, packages []*ImportPackage) bool {
+	for p := range packages {
+		if packages[p].name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
+	parent *ImportPackage, setting *Settings) {
 	isFunctionImport := false
 	var functions []string
 	var shortName, name string
@@ -220,18 +237,32 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string, p
 			shortName = name
 		}
 	}
-	if ok, ptr := isAlreadyPackage(shortName, *packages); ok {
+	if isInList(name, setting.IgnorablePackages) {
+		return
+	} else if ok, ptr := isAlreadyPackage(shortName, *packages); ok {
 		functions = differenceListSet(functions, ptr.functions)
 		ptr.functions = append(ptr.functions, functions...)
 	} else {
-		this_package := ImportPackage{name: name, shortName: shortName,
-			packagePath:      filepath.Join(filepath.Dir(parentPath), name+".py"),
-			isFunctionImport: isFunctionImport, functions: functions, parent: parent}
+		this_package := ImportPackage{
+			name:             name,
+			shortName:        shortName,
+			packagePath:      findPath(parentPath, name, setting),
+			isFunctionImport: isFunctionImport,
+			functions:        functions,
+			parent:           parent}
 		*packages = append(*packages, &this_package)
 	}
 }
 
-func findFileImports(path string, parent *ImportPackage) ([]*ImportPackage, error) {
+func findPath(parentPath, name string, setting *Settings) string {
+	if val, ok := setting.InstallationPackages[name]; ok {
+		return val
+	}
+	path_name := strings.ReplaceAll(name, ".", "/")
+	return filepath.Join(filepath.Dir(parentPath), path_name+".py")
+}
+
+func findFileImports(path string, parent *ImportPackage, setting *Settings) ([]*ImportPackage, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -245,7 +276,7 @@ func findFileImports(path string, parent *ImportPackage) ([]*ImportPackage, erro
 	for scanner.Scan() {
 		line = scanner.Text()
 		if strings.Contains(line, "import") {
-			addImportPackage(line, &importPackages, path, parent)
+			addImportPackage(line, &importPackages, path, parent, setting)
 		} else {
 			parsePackagesFunctions(line, importPackages, counter, &calling_function)
 		}
@@ -254,9 +285,9 @@ func findFileImports(path string, parent *ImportPackage) ([]*ImportPackage, erro
 	return importPackages, scanner.Err()
 }
 
-func (p *ImportPackage) findChildImports() error {
+func (p *ImportPackage) findChildImports(setting *Settings) error {
 	// Call this recursively until we have exhausted the amount of imports
-	packages, err := findFileImports(p.packagePath, p)
+	packages, err := findFileImports(p.packagePath, p, setting)
 	if len(packages) == 0 {
 		return nil
 	}
@@ -267,21 +298,21 @@ func (p *ImportPackage) findChildImports() error {
 	// Need to refactor this later so it is in the same package creation step
 	p.childImports = packages
 	for i := range packages {
-		packages[i].findChildImports()
+		packages[i].findChildImports(setting)
 	}
 	return nil
 }
 
-func findAllImports(path string) ([]*ImportPackage, error) {
+func findAllImports(path string, setting *Settings) ([]*ImportPackage, error) {
 	// Starts by finding the main file's file imports
-	packages, err := findFileImports(path, nil)
+	packages, err := findFileImports(path, nil, setting)
 	if err != nil {
 		return nil, err
 	}
 	// Then find any subsequent imports that is necessary for the main file
 	// This alters the original packages returned from the above function
 	for i := range packages {
-		packages[i].findChildImports()
+		packages[i].findChildImports(setting)
 	}
 	return packages, nil
 }
@@ -312,7 +343,25 @@ func replacePackageNames(lineNumber int, s string, packages []*ImportPackage) st
 	return s
 }
 
-func copyOriginalFile(path string, outPath string, packages []*ImportPackage) error {
+func isValidLine(line string, settings *Settings, packages []*ImportPackage) bool {
+	var start_idx int
+	if strings.Contains(line, "import") {
+		if line[:4] == "from" {
+			start_idx = 5
+		} else {
+			start_idx = 7
+		}
+		name := parseWord(line[start_idx:])
+		check := doesPackageNameExist(name, packages)
+		// For it to be a valid line in this setting it must not be part of the packages we are replacing
+		// All packages which have not been flagged as replacable will be handled by the main dependency writer
+		return !check
+	}
+	return true
+}
+
+func copyOriginalFile(path string, outPath string,
+	packages []*ImportPackage, settings *Settings) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -328,7 +377,7 @@ func copyOriginalFile(path string, outPath string, packages []*ImportPackage) er
 	counter := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.Contains(line, "import") {
+		if isValidLine(line, settings, packages) {
 			line := replacePackageNames(counter, line, packages)
 			_, err := writer.WriteString(line + "\n")
 			if err != nil {
@@ -344,11 +393,43 @@ func copyOriginalFile(path string, outPath string, packages []*ImportPackage) er
 	return nil
 }
 
+func parseSettings(settingsPath string) (*Settings, error) {
+	var setting Settings
+	if settingsPath == "" {
+		return &setting, nil
+	}
+	file, err := os.Open(settingsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	var text []byte
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		text = append(text, line...)
+	}
+	json.Unmarshal([]byte(text), &setting)
+	return &setting, nil
+}
+
+func parseArgs() (string, string, string) {
+	// -o means out file to write to
+	// -s means a setting file, this should be a requirements file where a regular install from there should be ignored
+	// however any local path dependencies with editable installs, should included
+	// Could also use a json settings file with one list of ignorable packages and one with paths to editable packages
+	// The first argument should be a string pointing to a valid path to parse the functions from
+	path := flag.String("f", "", "Input File")
+	outFile := flag.String("o", "", "Output file")
+	settings := flag.String("s", "", "Settings file")
+	flag.Parse()
+	return *path, *outFile, *settings
+}
+
 func main() {
-	args := os.Args
-	path := args[1]
-	writePath := "C:\\Users\\thomast\\PycharmProjects\\ScriptAlone\\out.py"
-	packages, err := findAllImports(path)
+	path, writePath, settingsPath := parseArgs()
+	setting, _ := parseSettings(settingsPath)
+	packages, err := findAllImports(path, setting)
 	if err != nil {
 		panic("Something went wrong")
 	}
@@ -359,7 +440,7 @@ func main() {
 	// and then import those in a function here before the necessary dependency functions are imported
 	// and then file just import all the code from the passed in file after those other functions have been imported
 	importAllDependencies(packages, writePath)
-	err = copyOriginalFile(path, writePath, packages)
+	err = copyOriginalFile(path, writePath, packages, setting)
 	if err != nil {
 		panic("Something went wrong")
 	}
