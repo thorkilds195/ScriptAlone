@@ -22,6 +22,7 @@ type ImportPackage struct {
 	isFunctionImport bool             // is it imported as from module import function or not
 	functions        []string         // holds the name of the functions that is used from the package
 	lines            []int            // holds the position of the lines that the import package appears in to facilitate easier search when copying later
+	importSpan       [2]int           // holds the span of lines for the import statement, is an inclusive range from start to end
 	childImports     []*ImportPackage // a pointer to the next import packages in case of cascading imports
 	parent           *ImportPackage   // FATHER
 }
@@ -132,7 +133,7 @@ func differenceListSet(l1 []string, l2 []string) []string {
 }
 
 func parseFunctionName(s string) string {
-	// Parses from the first character in string to the next starting paranthesis
+	// Parses from the first character in string to the next starting parenthesis
 	a := make([]byte, 0)
 	for i := range s {
 		if s[i] == '(' {
@@ -153,8 +154,49 @@ func removeWhitespace(s string) string {
 	return string(out)
 }
 
-func parseImportFunctions(s string) []string {
+func parseImportFunctionsOld(s string, scanner *bufio.Scanner) []string {
 	funcs := strings.Split(s, ",")
+	for i := range funcs {
+		funcs[i] = removeWhitespace(funcs[i])
+	}
+	return funcs
+}
+
+func parseImportFunctions(s string, scanner *bufio.Scanner, counter *int) []string {
+	importIsDone := false
+	paranthesisStack := make([]byte, 1)
+	funcs := make([]string, 0)
+	var start, end int
+	for {
+		for i := range s {
+			switch s[i] {
+			case ',', '\n':
+				funcs = append(funcs, s[start:end])
+				end++
+				start = end
+			case '(':
+				paranthesisStack[0] = 1
+				end++
+				start = end
+			case ')':
+				paranthesisStack[0] = 0
+				funcs = append(funcs, s[start:end])
+				end++
+				start = end
+			default:
+				end++
+			}
+		}
+		start = 0
+		end = 0
+		importIsDone = paranthesisStack[0] == 0
+		if importIsDone {
+			break
+		}
+		scanner.Scan()
+		s = scanner.Text()
+		*counter++
+	}
 	for i := range funcs {
 		funcs[i] = removeWhitespace(funcs[i])
 	}
@@ -215,9 +257,10 @@ func doesPackageNameExist(name string, packages []*ImportPackage) bool {
 }
 
 func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
-	parent *ImportPackage, setting *Settings) {
+	parent *ImportPackage, setting *Settings, scanner *bufio.Scanner, counter *int) {
 	isFunctionImport := false
 	var functions []string
+	span := [2]int{*counter, 0}
 	var shortName, name string
 	if s[:4] == "from" {
 		isFunctionImport = true
@@ -225,7 +268,7 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
 		shortName = name
 		// Parse functions here
 		start_idx := strings.Index(s, "import")
-		functions = parseImportFunctions(s[start_idx+len("import"):])
+		functions = parseImportFunctions(s[start_idx+len("import"):], scanner, counter)
 	} else {
 		// If it is not a function import type package, then we need to search the rest of the text for any occurences of the named package to know which functions to import
 		start := "import"
@@ -237,6 +280,7 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
 			shortName = name
 		}
 	}
+	span[1] = *counter
 	if isInList(name, setting.IgnorablePackages) {
 		return
 	} else if ok, ptr := isAlreadyPackage(shortName, *packages); ok {
@@ -248,14 +292,22 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
 			shortName:        shortName,
 			packagePath:      findPath(parentPath, name, setting),
 			isFunctionImport: isFunctionImport,
+			importSpan:       span,
 			functions:        functions,
 			parent:           parent}
 		*packages = append(*packages, &this_package)
 	}
 }
 
+func findPathFromInitFile(package_name string, directory_path string) {
+	init_path := directory_path + "\\src\\" + package_name + "\\__init__.py"
+}
+
 func findPath(parentPath, name string, setting *Settings) string {
 	if val, ok := setting.InstallationPackages[name]; ok {
+		if val[len(val)-3:] != ".py" {
+			//val = findPathFromInitFile(name, val)
+		}
 		return val
 	}
 	path_name := strings.ReplaceAll(name, ".", "/")
@@ -276,7 +328,7 @@ func findFileImports(path string, parent *ImportPackage, setting *Settings) ([]*
 	for scanner.Scan() {
 		line = scanner.Text()
 		if strings.Contains(line, "import") {
-			addImportPackage(line, &importPackages, path, parent, setting)
+			addImportPackage(line, &importPackages, path, parent, setting, scanner, &counter)
 		} else {
 			parsePackagesFunctions(line, importPackages, counter, &calling_function)
 		}
@@ -343,19 +395,12 @@ func replacePackageNames(lineNumber int, s string, packages []*ImportPackage) st
 	return s
 }
 
-func isValidLine(line string, settings *Settings, packages []*ImportPackage) bool {
-	var start_idx int
-	if strings.Contains(line, "import") {
-		if line[:4] == "from" {
-			start_idx = 5
-		} else {
-			start_idx = 7
+func isValidLine(counter int, settings *Settings, packages []*ImportPackage) bool {
+	// TODO: Simply remove here based on the original import span, should get rid of the difficult part of the logic below
+	for i := range packages {
+		if counter >= packages[i].importSpan[0] && counter <= packages[i].importSpan[1] {
+			return false
 		}
-		name := parseWord(line[start_idx:])
-		check := doesPackageNameExist(name, packages)
-		// For it to be a valid line in this setting it must not be part of the packages we are replacing
-		// All packages which have not been flagged as replacable will be handled by the main dependency writer
-		return !check
 	}
 	return true
 }
@@ -377,7 +422,7 @@ func copyOriginalFile(path string, outPath string,
 	counter := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		if isValidLine(line, settings, packages) {
+		if isValidLine(counter, settings, packages) {
 			line := replacePackageNames(counter, line, packages)
 			_, err := writer.WriteString(line + "\n")
 			if err != nil {
