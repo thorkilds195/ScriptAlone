@@ -1,5 +1,12 @@
 package main
 
+// CURRENT: Need to find a way to parse the correct function from a package import
+// For that we need to know the functions that are used from it before parsing the correct function path
+// Because if they do import package as p and then we need to know the functions it is using and parse each of those functions by finding their path
+// so there path could be in any subdirectory in the main package
+// so if function print comes from package a and it comes from file p then we need to first find that print is being used from that package and then
+// find out where that function exists so we can import its definition. This means checking the init file and finding out how it is imported into the namespace of the package
+
 import (
 	"bufio"
 	"encoding/json"
@@ -20,11 +27,16 @@ type ImportPackage struct {
 	shortName        string           // the imported name into the relevant module
 	packagePath      string           // the path to the file that holds the package
 	isFunctionImport bool             // is it imported as from module import function or not
-	functions        []string         // holds the name of the functions that is used from the package
+	functions        []OneFunction    // holds the name of the functions that is used from the package
 	lines            []int            // holds the position of the lines that the import package appears in to facilitate easier search when copying later
 	importSpan       [2]int           // holds the span of lines for the import statement, is an inclusive range from start to end
 	childImports     []*ImportPackage // a pointer to the next import packages in case of cascading imports
 	parent           *ImportPackage   // FATHER
+}
+
+type OneFunction struct {
+	name string // The function name
+	path string // The path to the file which holds the function, this can be different from the import package when we are importing from a package and not a file directly
 }
 
 func (p *ImportPackage) importDependencies(toFile string, writtenDependencies *[]string) error {
@@ -49,9 +61,9 @@ func (p *ImportPackage) importDependencies(toFile string, writtenDependencies *[
 		if len(line) > 2 && line[:3] == "def" {
 			function_name := parseFunctionName(line[4:])
 			for _, v := range p.functions {
-				if v == function_name && !hasFunctionBeenWrittenBefore(function_name, writtenDependencies) {
+				if v.name == function_name && !hasFunctionBeenWrittenBefore(function_name, writtenDependencies) {
 					*writtenDependencies = append(*writtenDependencies, function_name)
-					def := parseFunctionDefinition(v, scanner, line)
+					def := parseFunctionDefinition(v.name, scanner, line)
 					writeFunctionDefinition(def, writer, p)
 					break
 				}
@@ -66,6 +78,72 @@ func (p *ImportPackage) importDependencies(toFile string, writtenDependencies *[
 		p.childImports[i].importDependencies(toFile, writtenDependencies)
 	}
 	return nil
+}
+
+func (p *ImportPackage) setFunctionPaths() error {
+	// CUR: First search for a matching function name import
+	// This would be the case for a certain import set based on function names in the init file
+	// This needs to be extendable to also support wildcard imports and later also named imports
+	// The below is stupid and can rather be done by referencing the child import functions directly
+	// No need to loop through everything again
+	// We can rather check whether the imported functions exists in one of the child packages
+	file, err := os.Open(p.packagePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	// counter := 0
+	// var functions []OneFunction
+	// var name string
+	// scanner := bufio.NewScanner(file)
+	// for scanner.Scan() {
+	// 	line := scanner.Text()
+	// 	if strings.Contains(line, "import") {
+	// 		name = parseWord(line[5:])
+	// 		functions = parseImportFunctions(line, scanner, &counter)
+	// 	}
+	// 	relevant_functions := differenceFunctionSet(p.functions, functions)
+	// 	for i := range relevant_functions {
+	// 		relevant_functions[i].path = p.packagePath + name + ".py"
+	// 	}
+	// }
+	// Traverse the tree of child imports and find a match per package
+	for i := range p.functions {
+		p.functions[i].path = p.findFunctionInTree(p.functions[i].name)
+	}
+	return nil
+}
+
+func (p *ImportPackage) findFunctionInTree(s string) string {
+	var out string
+	for _, childPackage := range p.childImports {
+		check := childPackage.traverseFunctionTree(s)
+		if check != "" {
+			out = check
+			break
+		}
+	}
+	if out == "" {
+		out = p.packagePath
+	}
+	return out
+}
+
+func (p *ImportPackage) traverseFunctionTree(s string) string {
+	var out string
+	// Returns a path to the file which contains the function that we are looking for
+	if isAlreadyFunction(s, p.functions) {
+		out = p.packagePath
+		return out
+	}
+	for _, childPackage := range p.childImports {
+		check := childPackage.findFunctionInTree(s)
+		if check != "" {
+			out = check
+			break
+		}
+	}
+	return out
 }
 
 func importAllDependencies(packages []*ImportPackage, writePath string) {
@@ -118,12 +196,12 @@ func parseWord(s string) string {
 	return string(a)
 }
 
-func differenceListSet(l1 []string, l2 []string) []string {
+func differenceFunctionSet(l1 []OneFunction, l2 []OneFunction) []OneFunction {
 	// Returns the diff between the first set and the second
-	out := make([]string, 0)
+	out := make([]OneFunction, 0)
 	for i := range l1 {
 		for j := range l2 {
-			if l1[i] == l2[j] {
+			if l1[i].name == l2[j].name {
 				break
 			}
 		}
@@ -162,16 +240,16 @@ func parseImportFunctionsOld(s string, scanner *bufio.Scanner) []string {
 	return funcs
 }
 
-func parseImportFunctions(s string, scanner *bufio.Scanner, counter *int) []string {
+func parseImportFunctions(s string, scanner *bufio.Scanner, counter *int) []OneFunction {
 	importIsDone := false
 	paranthesisStack := make([]byte, 1)
-	funcs := make([]string, 0)
+	funcs := make([]OneFunction, 0)
 	var start, end int
 	for {
 		for i := range s {
 			switch s[i] {
 			case ',', '\n':
-				funcs = append(funcs, s[start:end])
+				funcs = append(funcs, OneFunction{name: s[start:end]})
 				end++
 				start = end
 			case '(':
@@ -180,7 +258,7 @@ func parseImportFunctions(s string, scanner *bufio.Scanner, counter *int) []stri
 				start = end
 			case ')':
 				paranthesisStack[0] = 0
-				funcs = append(funcs, s[start:end])
+				funcs = append(funcs, OneFunction{name: s[start:end]})
 				end++
 				start = end
 			default:
@@ -198,7 +276,7 @@ func parseImportFunctions(s string, scanner *bufio.Scanner, counter *int) []stri
 		*counter++
 	}
 	for i := range funcs {
-		funcs[i] = removeWhitespace(funcs[i])
+		funcs[i].name = removeWhitespace(funcs[i].name)
 	}
 	return funcs
 }
@@ -206,6 +284,15 @@ func parseImportFunctions(s string, scanner *bufio.Scanner, counter *int) []stri
 func isInList(s string, l []string) bool {
 	for _, v := range l {
 		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+func isAlreadyFunction(s string, l []OneFunction) bool {
+	for _, v := range l {
+		if s == v.name {
 			return true
 		}
 	}
@@ -226,9 +313,9 @@ func parsePackagesFunctions(s string, packages []*ImportPackage, lineNumber int,
 			if i == -1 {
 				break
 			}
-			next_function := parseFunctionName(s[i+len(packages[p].shortName)+1:])
-			if !isInList(next_function, packages[p].functions) {
-				if packages[p].parent == nil || isInList(*calling_function, packages[p].parent.functions) {
+			next_function := OneFunction{name: parseFunctionName(s[i+len(packages[p].shortName)+1:])}
+			if !isAlreadyFunction(next_function.name, packages[p].functions) {
+				if packages[p].parent == nil || isAlreadyFunction(*calling_function, packages[p].parent.functions) {
 					packages[p].functions = append(packages[p].functions, next_function)
 				}
 			}
@@ -259,7 +346,7 @@ func doesPackageNameExist(name string, packages []*ImportPackage) bool {
 func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
 	parent *ImportPackage, setting *Settings, scanner *bufio.Scanner, counter *int) {
 	isFunctionImport := false
-	var functions []string
+	var functions []OneFunction
 	span := [2]int{*counter, 0}
 	var shortName, name string
 	if s[:4] == "from" {
@@ -284,7 +371,7 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
 	if isInList(name, setting.IgnorablePackages) {
 		return
 	} else if ok, ptr := isAlreadyPackage(shortName, *packages); ok {
-		functions = differenceListSet(functions, ptr.functions)
+		functions = differenceFunctionSet(functions, ptr.functions)
 		ptr.functions = append(ptr.functions, functions...)
 	} else {
 		this_package := ImportPackage{
@@ -299,14 +386,14 @@ func addImportPackage(s string, packages *[]*ImportPackage, parentPath string,
 	}
 }
 
-func findPathFromInitFile(package_name string, directory_path string) {
-	init_path := directory_path + "\\src\\" + package_name + "\\__init__.py"
+func findInitFilePath(package_name string, directory_path string) string {
+	return directory_path + "\\src\\" + package_name + "\\__init__.py"
 }
 
 func findPath(parentPath, name string, setting *Settings) string {
 	if val, ok := setting.InstallationPackages[name]; ok {
 		if val[len(val)-3:] != ".py" {
-			//val = findPathFromInitFile(name, val)
+			val = findInitFilePath(name, val)
 		}
 		return val
 	}
@@ -365,6 +452,9 @@ func findAllImports(path string, setting *Settings) ([]*ImportPackage, error) {
 	// This alters the original packages returned from the above function
 	for i := range packages {
 		packages[i].findChildImports(setting)
+	}
+	for i := range packages {
+		packages[i].setFunctionPaths()
 	}
 	return packages, nil
 }

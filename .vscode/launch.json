@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+        "name": "Launch",
+        "type": "go",
+        "request": "launch",
+        "mode": "auto",
+        "program": "main.go",
+        "args": [
+            "-f=C:\\Users\\thomast\\PycharmProjects\\ScriptAlone\\test\\main.py", 
+            "-o=C:\\Users\\thomast\\PycharmProjects\\ScriptAlone\\out.py",
+            "-s=C:\\Users\\thomast\\PycharmProjects\\ScriptAlone\\setting.json"]
+        }    
+    ]
+}   

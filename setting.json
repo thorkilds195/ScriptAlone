@@ -1,0 +1,8 @@
+{
+    "IgnorablePackages": [
+        "sys"
+    ],
+    "InstallationPackages": {
+        "dbutils": "C:/Users/thomast/PycharmProjects/upstreamutilities/libraries/dbutils"
+    }
+}
